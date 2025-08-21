@@ -1,28 +1,24 @@
 import unreal
 unreal.log(">>> MayaImporter: Python script executed successfully! <<<")
 
-# import_unreal_V4.0_corrected.py
-# Maya/Unreal asset importer: FBX + optional textures + simple material creation.
-# Ready for plugin-triggered execution.
+############################
+# Unreal side importer (UE 5.6) — preserves Maya material/texture names, imports textures first,
+# then imports the mesh with materials (no new material creation), and imports animations
+# only if an *_anim.fbx exists AND a matching Skeleton is found (so no stray Animations folder).
+############################
 
 import unreal
 import os
 import datetime
 import traceback
 
-
-# === CONFIGURATION ===
-
+# === CONFIG ===
 BASE_IMPORT_DIR = "/Game/Assets"
 TEXTURE_EXTS = (".png", ".jpg", ".jpeg", ".tga", ".tif", ".tiff", ".exr", ".bmp", ".hdr")
 
-
 # === LOGGING ===
-
 LOG_FILE = os.path.join(
-    unreal.SystemLibrary.get_project_saved_directory(),
-    "Logs",
-    "UnrealImportAssets.log"
+    unreal.SystemLibrary.get_project_saved_directory(), "Logs", "UnrealImportAssets.log"
 )
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 
@@ -38,9 +34,7 @@ def log_msg(msg):   _log(unreal.log, "",            msg)
 def log_warn(msg):  _log(unreal.log_warning, "W: ", msg)
 def log_error(msg): _log(unreal.log_error,   "E: ", msg)
 
-
 # === UTILITIES ===
-
 def ensure_directory(ue_path: str):
     if not unreal.EditorAssetLibrary.does_directory_exist(ue_path):
         unreal.EditorAssetLibrary.make_directory(ue_path)
@@ -52,33 +46,68 @@ def project_content_dir() -> str:
 def is_texture_file(filename: str) -> bool:
     return filename.lower().endswith(TEXTURE_EXTS)
 
-
 # === DISCOVERY ===
-
 def find_maya_exports():
+    """
+    Finds exports laid out as:
+        Content/.../Meshes/<AssetName>.fbx
+        Content/.../Textures/<AssetName>/...   (optional)
+        Content/.../Animations/<AssetName>_anim.fbx  (optional)
+    """
     content_dir = project_content_dir()
-    results = []
+    results = []  # (asset_name, fbx_path, textures_dir, anim_fbx_path_or_None)
 
     for root, _, files in os.walk(content_dir):
         if os.path.basename(root).lower() != "meshes":
             continue
-
         for f in files:
             if not f.lower().endswith(".fbx"):
                 continue
-
             fbx_path = os.path.join(root, f)
             asset_name = os.path.splitext(f)[0]
-            textures_dir = os.path.normpath(os.path.join(root, "..", "Textures", asset_name))
 
-            results.append((asset_name, fbx_path, textures_dir))
+            root_dir = os.path.normpath(os.path.join(root, ".."))
+            textures_dir = os.path.normpath(os.path.join(root_dir, "Textures", asset_name))
+            anim_fbx = os.path.normpath(os.path.join(root_dir, "Animations", f"{asset_name}_anim.fbx"))
+            if not os.path.isfile(anim_fbx):
+                anim_fbx = None
 
+            results.append((asset_name, fbx_path, textures_dir, anim_fbx))
     return results
 
+# === IMPORT HELPERS ===
+def import_textures(textures_dir_disk: str, textures_dir_ue: str):
+    """Import textures first so material import can reuse them by original file names."""
+    imported = {}
+    if not os.path.isdir(textures_dir_disk):
+        return imported
 
-# === IMPORT WORK ===
+    tasks = []
+    for fname in os.listdir(textures_dir_disk):
+        if not is_texture_file(fname):
+            continue
+        src = os.path.join(textures_dir_disk, fname)
+        t = unreal.AssetImportTask()
+        t.filename = src
+        t.destination_path = textures_dir_ue
+        t.automated = True
+        t.replace_identical = True
+        t.save = True
+        tasks.append(t)
 
-def import_mesh(asset_name: str, fbx_disk_path: str, meshes_dir: str):
+    if tasks:
+        unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks(tasks)
+        for t in tasks:
+            if getattr(t, "imported_object_paths", None):
+                tex_asset = unreal.load_asset(t.imported_object_paths[0])
+                if tex_asset:
+                    basename = os.path.basename(t.filename).lower()
+                    imported[basename] = tex_asset
+                    log_msg(f"✔ Imported texture: {tex_asset.get_path_name()}")
+    return imported
+
+def import_static_mesh_with_materials(asset_name: str, fbx_disk_path: str, meshes_dir: str, reuse_textures=True):
+    """Import Static Mesh; import materials from FBX; optionally skip importing textures (reuse already-imported)."""
     task = unreal.AssetImportTask()
     task.filename = fbx_disk_path
     task.destination_path = meshes_dir
@@ -90,117 +119,83 @@ def import_mesh(asset_name: str, fbx_disk_path: str, meshes_dir: str):
     fbx_ui.import_mesh = True
     fbx_ui.import_as_skeletal = False
     fbx_ui.import_animations = False
+    fbx_ui.import_materials = True
+    fbx_ui.import_textures = not reuse_textures  # if textures already imported, avoid duplicates
+    # Preserve mesh parts and normals/tangents from FBX (works with Maya-baked smoothing)
+    sm = unreal.FbxStaticMeshImportData()
+    sm.combine_meshes = False
+    try:
+        sm.normal_import_method = unreal.FBXNormalImportMethod.FBXNIM_ImportNormalsAndTangents
+    except Exception:
+        pass  # property name varies across minor versions; safe to skip
+    fbx_ui.static_mesh_import_data = sm
 
     task.options = fbx_ui
-
     unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
 
-    # Load imported mesh
+    # Try to load the mesh (by canonical name or by returned path)
     mesh_asset_path = f"{meshes_dir}/{asset_name}"
     mesh_asset = unreal.EditorAssetLibrary.load_asset(mesh_asset_path)
     if not mesh_asset:
-        imported_paths = getattr(task, "imported_object_paths", None)
-        if imported_paths:
-            candidate = imported_paths[0]
-            mesh_asset = unreal.EditorAssetLibrary.load_asset(candidate)
-
+        imported_paths = getattr(task, "imported_object_paths", None) or []
+        for p in imported_paths:
+            obj = unreal.EditorAssetLibrary.load_asset(p)
+            if isinstance(obj, unreal.StaticMesh):
+                mesh_asset = obj
+                break
     if not mesh_asset:
         raise RuntimeError(f"Failed to load imported mesh for '{asset_name}'.")
-
     log_msg(f"✔ Imported Static Mesh: {mesh_asset.get_path_name()}")
     return mesh_asset
 
-
-def import_textures(textures_dir_disk: str, textures_dir_ue: str):
-    imported = {}
-
-    if not os.path.isdir(textures_dir_disk):
-        log_warn(f"No textures folder found: {textures_dir_disk}")
-        return imported
-
-    for fname in os.listdir(textures_dir_disk):
-        if not is_texture_file(fname):
-            continue
-        src = os.path.join(textures_dir_disk, fname)
-
-        ttask = unreal.AssetImportTask()
-        ttask.filename = src
-        ttask.destination_path = textures_dir_ue
-        ttask.automated = True
-        ttask.replace_identical = True
-        ttask.save = True
-
-        unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([ttask])
-
-        if getattr(ttask, "imported_object_paths", None):
-            tex_asset = unreal.load_asset(ttask.imported_object_paths[0])
-            if tex_asset:
-                imported[fname.lower()] = tex_asset
-                log_msg(f"✔ Imported texture: {tex_asset.get_path_name()}")
-        else:
-            log_warn(f"Texture import failed: {src}")
-
-    return imported
-
-
-def choose_basecolor_texture(imported_textures: dict):
-    keys = ("basecolor", "base_color", "albedo", "diffuse", "color")
-    for name, tex in imported_textures.items():
-        if any(k in name.lower() for k in keys):
-            return tex
-    if len(imported_textures) == 1:
-        return next(iter(imported_textures.values()))
+def find_skeleton_for_asset(dest_root: str):
+    """Look for a Skeleton under the asset bucket to bind animations; return None if not found."""
+    try:
+        for p in unreal.EditorAssetLibrary.list_assets(dest_root, recursive=True):
+            obj = unreal.EditorAssetLibrary.load_asset(p)
+            if isinstance(obj, unreal.SkeletalMesh):
+                return obj.get_editor_property("skeleton")
+            if isinstance(obj, unreal.Skeleton):
+                return obj
+    except Exception:
+        pass
     return None
 
+def import_animation_if_available(asset_name: str, anim_fbx_path: str, dest_root: str):
+    """Import animation only if anim FBX exists and a Skeleton is found. Avoids creating an Animations folder otherwise."""
+    if not anim_fbx_path or not os.path.isfile(anim_fbx_path):
+        return False
 
-def create_simple_material(asset_name: str, materials_dir: str, basecolor_tex):
-    mat_name = f"{asset_name}_M"
-    mat_path = f"{materials_dir}/{mat_name}"
+    skeleton = find_skeleton_for_asset(dest_root)
+    if not skeleton:
+        log_warn(f"No Skeleton found for '{asset_name}'. Skipping animation import.")
+        return False
 
-    if unreal.EditorAssetLibrary.does_asset_exist(mat_path):
-        unreal.EditorAssetLibrary.delete_asset(mat_path)
-        log_warn(f"Overwriting existing material: {mat_path}")
+    anim_dir = f"{dest_root}/Animations"
+    ensure_directory(anim_dir)
 
-    material = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
-        asset_name=mat_name,
-        package_path=materials_dir,
-        asset_class=unreal.Material,
-        factory=unreal.MaterialFactoryNew(),
-    )
-    if not material:
-        raise RuntimeError(f"Failed to create material '{mat_name}'.")
+    task = unreal.AssetImportTask()
+    task.filename = anim_fbx_path
+    task.destination_path = anim_dir
+    task.automated = True
+    task.replace_identical = True
+    task.save = True
 
-    if basecolor_tex:
-        sample = unreal.MaterialEditingLibrary.create_texture_sample(material, basecolor_tex)
-        unreal.MaterialEditingLibrary.connect_material_property(
-            sample, unreal.MaterialProperty.MP_BASE_COLOR
-        )
+    fbx_ui = unreal.FbxImportUI()
+    fbx_ui.import_mesh = False
+    fbx_ui.import_as_skeletal = True
+    fbx_ui.import_animations = True
+    fbx_ui.skeleton = skeleton
 
-    unreal.EditorAssetLibrary.save_loaded_asset(material)
-    log_msg(f"✔ Created material: {material.get_path_name()}")
-    return material
+    task.options = fbx_ui
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
 
-
-def assign_material(mesh_asset, material):
-    try:
-        slot_count = mesh_asset.get_num_materials()
-    except Exception:
-        slot_count = 1
-
-    for slot in range(slot_count):
-        try:
-            mesh_asset.set_material(slot, material)
-        except Exception as e:
-            log_warn(f"Failed to set material on slot {slot}: {e}")
-
-    mesh_asset.post_edit_change()
-    mesh_asset.mark_package_dirty()
-    unreal.EditorAssetLibrary.save_loaded_asset(mesh_asset)
-    log_msg(f"✔ Assigned material to {slot_count} slot(s) on {mesh_asset.get_path_name()}")
-
+    imported_any = bool(getattr(task, "imported_object_paths", None))
+    if imported_any:
+        log_msg(f"✔ Imported Animation(s) for '{asset_name}' into {anim_dir}")
+    return imported_any
 
 # === MAIN ===
-
 def main():
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as lf:
@@ -213,24 +208,29 @@ def main():
         log_warn("No FBX files found under Content/*/Meshes/. Nothing to import.")
         return
 
-    for asset_name, fbx_disk_path, textures_dir_disk in exports:
+    for asset_name, fbx_disk_path, textures_dir_disk, anim_fbx_disk in exports:
         try:
-            dest_root = f"{BASE_IMPORT_DIR}/{asset_name}"
-            meshes_dir = f"{dest_root}/Meshes"
-            textures_dir = f"{dest_root}/Textures"
-            materials_dir = f"{dest_root}/Materials"
+            dest_root     = f"{BASE_IMPORT_DIR}/{asset_name}"
+            meshes_dir    = f"{dest_root}/Meshes"
+            textures_dir  = f"{dest_root}/Textures"
+            # Only create /Animations if we actually import an anim (handled in function)
 
-            for d in (meshes_dir, textures_dir, materials_dir):
+            for d in (meshes_dir, textures_dir):
                 ensure_directory(d)
 
             log_msg(f"=== Importing '{asset_name}' ===")
-            mesh = import_mesh(asset_name, fbx_disk_path, meshes_dir)
 
+            # 1) Import textures first so FBX material import can reuse them by name
             imported_textures = import_textures(textures_dir_disk, textures_dir)
-            base_tex = choose_basecolor_texture(imported_textures)
 
-            material = create_simple_material(asset_name, materials_dir, base_tex)
-            assign_material(mesh, material)
+            # 2) Import the mesh + materials (do NOT import textures again)
+            _ = import_static_mesh_with_materials(asset_name, fbx_disk_path, meshes_dir, reuse_textures=bool(imported_textures))
+
+            # 3) Import animation only if *_anim.fbx exists AND a Skeleton is present
+            if anim_fbx_disk:
+                imported_anim = import_animation_if_available(asset_name, anim_fbx_disk, dest_root)
+                if not imported_anim:
+                    log_warn(f"No animation imported for '{asset_name}' (no Skeleton or empty file).")
 
             log_msg(f"=== Finished '{asset_name}' ===\n")
 
@@ -239,4 +239,5 @@ def main():
 
     log_msg("All asset imports complete.")
 
-# Removed automatic execution: main() will be called by plugin button
+# Run immediately when triggered by the plugin
+main()
