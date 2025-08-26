@@ -76,11 +76,68 @@ def find_maya_exports():
     return results
 
 # === IMPORT HELPERS ===
+
 def import_textures(textures_dir_disk: str, textures_dir_ue: str):
     """Import textures first so material import can reuse them by original file names."""
     imported = {}
     if not os.path.isdir(textures_dir_disk):
         return imported
+
+    # Try to load manifest if present
+    manifest = {}
+    manifest_path = os.path.join(textures_dir_disk, "import_manifest.json")
+    if os.path.isfile(manifest_path):
+        try:
+            import json
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for tex in data.get("textures", []):
+                manifest[tex.get("filename").lower()] = tex
+            log_msg(f"Loaded texture manifest: {manifest_path}")
+        except Exception as e:
+            log_warn(f"Failed to read manifest: {e}")
+
+    tasks = []
+    for fname in os.listdir(textures_dir_disk):
+        if not is_texture_file(fname):
+            continue
+        src = os.path.join(textures_dir_disk, fname)
+        t = unreal.AssetImportTask()
+        t.filename = src
+        t.destination_path = textures_dir_ue
+        t.automated = True
+        t.replace_identical = True
+        t.save = True
+        tasks.append(t)
+
+    if tasks:
+        unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks(tasks)
+        for t in tasks:
+            if getattr(t, "imported_object_paths", None):
+                tex_asset = unreal.load_asset(t.imported_object_paths[0])
+                if tex_asset:
+                    basename = os.path.basename(t.filename).lower()
+                    imported[basename] = tex_asset
+                    log_msg(f"✔ Imported texture: {tex_asset.get_path_name()}")
+                    # Apply compression if manifest has hint
+                    info = manifest.get(os.path.basename(t.filename).lower())
+                    if info:
+                        usage = info.get("usage")
+                        try:
+                            if usage == "normal":
+                                tex_asset.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_NORMALMAP)
+                                tex_asset.set_editor_property("srgb", False)
+                                log_msg(f"   → Compression set to Normalmap (BC5), sRGB OFF")
+                            else:
+                                tex_asset.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_BC7)
+                                tex_asset.set_editor_property("srgb", True)
+                                log_msg(f"   → Compression set to BC7 (color), sRGB ON")
+                            tex_asset.post_edit_change()
+                            unreal.EditorAssetLibrary.save_loaded_asset(tex_asset)
+                        except Exception as e:
+                            log_warn(f"Failed to apply compression: {e}")
+    return imported
+
 
     tasks = []
     for fname in os.listdir(textures_dir_disk):
