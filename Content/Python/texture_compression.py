@@ -53,7 +53,10 @@ def apply_texture_compression_rules(asset_paths, manifest_path=None):
         if not asset:
             continue
         if isinstance(asset, unreal.Texture):
-            filename = unreal.Paths.get_base_filename(path) + "." + asset.get_editor_property("compression_none").__class__.__name__  # dummy to avoid unused var
-            # Prefer manifest usage if present; otherwise fall back to name tokens.
-            usage = hints.get(os.path.basename(path)) or ("normal" if _is_normal_by_name(path) else "color")
-            _apply_to_texture_asset(asset, usage)
+            # Prefer manifest usage keyed by the original disk filename; fallback to name tokens.
+    try:
+        src = asset.get_editor_property("asset_import_data").get_first_filename() or ""
+    except Exception:
+        src = ""
+        basename = os.path.basename(src).lower() if src else ""
+        usage = hints.get(basename) or ("normal" if _is_normal_by_name(src or path) else "color")
