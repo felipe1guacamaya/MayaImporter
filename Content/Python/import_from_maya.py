@@ -7,7 +7,6 @@ unreal.log(">>> MayaImporter: Python script executed successfully! <<<")
 # only if an *_anim.fbx exists AND a matching Skeleton is found (so no stray Animations folder).
 ############################
 
-import unreal
 import os
 import datetime
 import traceback
@@ -298,3 +297,4 @@ def main():
 
 # Run immediately when triggered by the plugin
 main()
+
